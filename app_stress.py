@@ -90,36 +90,40 @@ curl -X POST http://localhost:8000/stress-test \
 
 from __future__ import annotations
 from typing import Dict, List, Optional
-from dataclasses import dataclass
-from math import isnan
-
 import numpy as np
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, conint, confloat
 
-# ----------------------
-# Models
-# ----------------------
+
+# =========================
+# Pydantic models
+# =========================
+
 class EarlyDrawdownCfg(BaseModel):
     enabled: bool = True
     months: conint(ge=1, le=36) = 6
-    shock_pct: confloat(lt=0, gt=-0.95) = -0.2
-    depressed_mu: confloat(ge=-0.5, le=0.2) = 0.02
+    shock_pct: confloat(lt=0, gt=-0.95) = -0.20   # e.g. -20% in month 1
+    depressed_mu: confloat(ge=-0.5, le=0.2) = 0.02  # annual drift during first `months`
+
 
 class SipPauseCfg(BaseModel):
     enabled: bool = True
     months: List[conint(ge=1)] = Field(default_factory=list, description="1-based months where SIP is skipped")
 
+
 class HighInflationCfg(BaseModel):
     enabled: bool = True
-    inflation: confloat(ge=0, le=0.2) = 0.07
+    inflation: confloat(ge=0, le=0.2) = 0.07  # 7% p.a. inflation
+
 
 class ScenariosCfg(BaseModel):
     base: Dict[str, bool] = {"enabled": True}
     early_drawdown: EarlyDrawdownCfg = EarlyDrawdownCfg()
     sip_pause: SipPauseCfg = SipPauseCfg()
     high_inflation: HighInflationCfg = HighInflationCfg()
+
 
 class StressRequest(BaseModel):
     corpus: confloat(ge=0)
@@ -134,8 +138,10 @@ class StressRequest(BaseModel):
 
     scenarios: ScenariosCfg = ScenariosCfg()
 
+
 class Percentiles(BaseModel):
     p5: float; p25: float; p50: float; p75: float; p95: float
+
 
 class ScenarioResult(BaseModel):
     scenario: str
@@ -148,119 +154,158 @@ class ScenarioResult(BaseModel):
     target_used: float
     notes: str
 
+
 class StressResponse(BaseModel):
     results: List[ScenarioResult]
 
-# ----------------------
+
+# =========================
 # Helpers
-# ----------------------
+# =========================
 
 def to_monthly(mu_annual: float, sigma_annual: float):
-    mu_m = np.log1p(mu_annual) / 12.0     # log drift per month
+    """Convert annual to monthly GBM log-params."""
+    mu_m = np.log1p(mu_annual) / 12.0
     sigma_m = sigma_annual / np.sqrt(12.0)
     return mu_m, sigma_m
 
 
-def simulate(req: StressRequest, *, variant: str) -> ScenarioResult:
-    if req.seed is not None:
-        np.random.seed(req.seed + hash(variant) % 10_000)
+def gen_common_returns(seed: Optional[int], sims: int, months: int,
+                       mu_annual: float, sigma_annual: float):
+    """
+    Generate ONE common panel of monthly returns for all scenarios.
+    Returns:
+      base_returns: (sims, months) simple returns for the base case
+      Z:            (sims, months) underlying standard normal shocks (for aligned transformations)
+      mu_m, sigma_m
+    """
+    if seed is not None:
+        np.random.seed(seed)
 
-    months = int(round(req.years * 12))
-    sims = int(req.sims)
-    mu_m, sigma_m = to_monthly(req.mu_annual, req.sigma_annual)
+    mu_m, sigma_m = to_monthly(mu_annual, sigma_annual)
+    Z = np.random.normal(size=(sims, months))          # same shocks for every scenario
+    base_returns = np.exp((mu_m - 0.5 * sigma_m**2) + sigma_m * Z) - 1.0
+    return base_returns, Z, mu_m, sigma_m
 
-    # random normals for full panel
-    Z = np.random.normal(size=(sims, months))
-    monthly_r = np.exp((mu_m - 0.5 * sigma_m**2) + sigma_m * Z) - 1.0  # simple returns
 
-    # Start values
-    V = np.full(sims, float(req.corpus), dtype=np.float64)
-
-    # Scenario-specific adjustments
-    target_used = float(req.target)
-    notes: List[str] = []
-
-    if variant == "early_drawdown" and req.scenarios.early_drawdown.enabled:
-        ed = req.scenarios.early_drawdown
-        m0 = min(months, int(ed.months))
-        # One-off shock at month 1
-        monthly_r[:, 0] = (1.0 + monthly_r[:, 0]) * (1.0 + float(ed.shock_pct)) - 1.0
-        notes.append(f"Shock {ed.shock_pct*100:.0f}% in month 1; depressed mu for {m0} months")
-        # Depressed drift for first m0 months
-        mu_m_dep, sigma_m_dep = to_monthly(float(ed.depressed_mu), req.sigma_annual)
-        Z2 = np.random.normal(size=(sims, m0))
-        monthly_r[:, :m0] = np.exp((mu_m_dep - 0.5 * sigma_m_dep**2) + sigma_m_dep * Z2) - 1.0
-
-    skip_months = set()
-    if variant == "sip_pause" and req.scenarios.sip_pause.enabled:
-        skip_months = {int(m) for m in req.scenarios.sip_pause.months if 1 <= int(m) <= months}
-        if skip_months:
-            notes.append(f"SIP paused in months: {sorted(skip_months)}")
-
-    if variant == "high_inflation" and req.scenarios.high_inflation.enabled:
-        infl = float(req.scenarios.high_inflation.inflation)
-        target_used = float(req.target) * ((1.0 + infl) ** float(req.years))
-        notes.append(f"Target inflated to ₹{target_used:,.0f} at {infl*100:.1f}% p.a.")
-
-    # Monthly loop
-    sip = float(req.sip)
+def evolve_portfolio(returns: np.ndarray, sip: float, corpus0: float,
+                     skip_months_1based: Optional[set] = None) -> np.ndarray:
+    """
+    Evolve portfolio with monthly SIP at start of month, then apply return.
+    returns: (sims, months)
+    skip_months_1based: set of months where SIP is skipped (1-based)
+    """
+    sims, months = returns.shape
+    V = np.full(sims, float(corpus0), dtype=np.float64)
+    skip = skip_months_1based or set()
     for m in range(months):
-        if not (variant == "sip_pause" and (m+1) in skip_months):
-            V += sip  # contribute at start of month
-        V *= (1.0 + monthly_r[:, m])
+        if (m + 1) not in skip:
+            V += sip
+        V *= (1.0 + returns[:, m])
+    return V
 
-    p = np.mean(V >= target_used)
+
+def summarize(V: np.ndarray, target_used: float, months: int, sims: int,
+              scenario_name: str, notes: str) -> ScenarioResult:
+    p = float(np.mean(V >= target_used))
     mean_final = float(np.mean(V))
     median_final = float(np.median(V))
-    p5, p25, p50, p75, p95 = np.percentile(V, [5,25,50,75,95])
+    p5, p25, p50, p75, p95 = np.percentile(V, [5, 25, 50, 75, 95])
 
     return ScenarioResult(
-        scenario=variant,
-        success_probability=float(p),
-        mean_final=float(mean_final),
-        median_final=float(median_final),
-        percentiles=Percentiles(p5=float(p5), p25=float(p25), p50=float(p50), p75=float(p75), p95=float(p95)),
+        scenario=scenario_name,
+        success_probability=p,
+        mean_final=mean_final,
+        median_final=median_final,
+        percentiles=Percentiles(
+            p5=float(p5), p25=float(p25), p50=float(p50), p75=float(p75), p95=float(p95)
+        ),
         months=months,
         simulations=sims,
         target_used=float(target_used),
-        notes=", ".join(notes) if notes else "",
+        notes=notes
     )
 
-# ----------------------
-# App
-# ----------------------
-app = FastAPI(title="Stress-Test MF Goal API", version="1.0.0")
+
+# =========================
+# FastAPI app
+# =========================
+
+app = FastAPI(title="Stress-Test MF Goal API (Aligned Paths)", version="2.0.0")
+
+# CORS for web embedding
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],           # tighten later to your domains
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.post("/stress-test", response_model=StressResponse)
 def stress_test(req: StressRequest):
+    months = int(round(float(req.years) * 12))
+    sims = int(req.sims)
+
+    # 1) Generate ONE common set of random market shocks & base returns
+    base_returns, Z, mu_m, sigma_m = gen_common_returns(
+        req.seed, sims, months, float(req.mu_annual), float(req.sigma_annual)
+    )
+
     results: List[ScenarioResult] = []
-    cfg = req.scenarios
 
-    # Base
-    if cfg.base.get("enabled", True):
-        results.append(simulate(req, variant="base"))
+    # ---------- Base (uses common base returns unchanged) ----------
+    if req.scenarios.base.get("enabled", True):
+        V_base = evolve_portfolio(base_returns, float(req.sip), float(req.corpus))
+        results.append(summarize(
+            V_base, float(req.target), months, sims, "base",
+            notes="Normal market ups & downs (expected ~13% p.a., with volatility)."
+        ))
 
-    # Early drawdown
-    if cfg.early_drawdown.enabled:
-        results.append(simulate(req, variant="early_drawdown"))
+    # ---------- Early Drawdown (aligned) ----------
+    if req.scenarios.early_drawdown.enabled:
+        ed = req.scenarios.early_drawdown
+        m0 = max(1, min(months, int(ed.months)))
 
-    # SIP pause
-    if cfg.sip_pause.enabled:
-        results.append(simulate(req, variant="sip_pause"))
+        # Use SAME Z for first m0 months, but with depressed drift (and same sigma)
+        mu_m_dep, sigma_m_dep = to_monthly(float(ed.depressed_mu), float(req.sigma_annual))
+        # Recompute returns for first m0 months using SAME shocks Z[:, :m0]
+        r_ed = base_returns.copy()
+        r_ed[:, :m0] = np.exp((mu_m_dep - 0.5 * sigma_m_dep**2) + sigma_m_dep * Z[:, :m0]) - 1.0
 
-    # High inflation
-    if cfg.high_inflation.enabled:
-        results.append(simulate(req, variant="high_inflation"))
+        # Apply one-off shock in month 1 on top of depressed month-1 return
+        r_ed[:, 0] = (1.0 + r_ed[:, 0]) * (1.0 + float(ed.shock_pct)) - 1.0
+
+        V_ed = evolve_portfolio(r_ed, float(req.sip), float(req.corpus))
+        results.append(summarize(
+            V_ed, float(req.target), months, sims, "early_drawdown",
+            notes=f"Early crash {ed.shock_pct*100:.0f}% in month 1, then {m0} months of weak returns."
+        ))
+
+    # ---------- SIP Pause (aligned) ----------
+    if req.scenarios.sip_pause.enabled:
+        sp = req.scenarios.sip_pause
+        skip = {int(m) for m in sp.months if 1 <= int(m) <= months}
+        V_sp = evolve_portfolio(base_returns, float(req.sip), float(req.corpus), skip_months_1based=skip)
+        results.append(summarize(
+            V_sp, float(req.target), months, sims, "sip_pause",
+            notes=f"SIP skipped in months: {sorted(skip)}." if skip else "No SIP months skipped."
+        ))
+
+    # ---------- High Inflation (aligned) ----------
+    if req.scenarios.high_inflation.enabled:
+        hi = req.scenarios.high_inflation
+        target_inflated = float(req.target) * ((1.0 + float(hi.inflation)) ** float(req.years))
+        V_hi = evolve_portfolio(base_returns, float(req.sip), float(req.corpus))
+        results.append(summarize(
+            V_hi, float(target_inflated), months, sims, "high_inflation",
+            notes=f"Target inflated to ₹{target_inflated:,.0f} at {hi.inflation*100:.1f}% p.a."
+        ))
 
     return StressResponse(results=results)
